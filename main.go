@@ -1,86 +1,127 @@
 package main
 
 import (
-	"file-transfer/core"
-	"file-transfer/events"
-	"file-transfer/ipc"
-	"file-transfer/logger"
-	server "file-transfer/network"
-	"file-transfer/network/signaling"
+	"encoding/json"
+	"errors"
+	"file-transfer/client"
+	"file-transfer/p2p"
+	"file-transfer/tasks"
 	"fmt"
+	"log"
+	"net"
 	"os"
-	"os/signal"
-	"syscall"
 )
 
-func main() {
-	logger.InitLogger()
-	exitSignal := make(chan os.Signal, 1)
-	ipcIn := make(chan *events.EventMsg)
-	ipcOut := make(chan *events.EventMsg)
-	networkIn := make(chan *events.EventMsg)
-	networkOut := make(chan *events.EventMsg)
-	p2pServer := server.InitServer(networkIn, networkOut)
-	dispatcher := core.InitializeDispatcher(ipcIn,
-		ipcOut,
-		networkIn,
-		networkOut)
+type DaemonServer struct {
+	listener   *net.UnixListener
+	clientConn *net.UnixConn
 
-	serverEventFd, err := ipc.InitEventFd()
+	p2pServer *p2p.Server
+}
+
+// 2type DispatchMessage struct {
+//
+// 2}
+
+func initializeDaemon() (*DaemonServer, error) {
+	path := "/tmp/unix.sock"
+	if _, err := os.Stat(path); err == nil {
+		fmt.Println(os.Remove(path))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{
+		Name: path, Net: "unixpacket",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := listener.Accept()
+	if err != nil {
+		fmt.Printf("failed to accept unix conn %v\n", err)
+		return nil, err
+	}
+	fmt.Println("connected with client through unix")
+	return &DaemonServer{
+		listener: listener, clientConn: conn.(*net.UnixConn),
+	}, nil
+}
+
+func (daemon *DaemonServer) response(eventType client.EventType, data any) {
+	responseMsg := client.Message{
+		Type: eventType,
+		Data: data,
+	}
+	result, err := json.Marshal(responseMsg)
 	if err != nil {
 		panic(err)
 	}
 
-	uiEventFd, err := ipc.InitEventFd()
+	_, err = daemon.clientConn.Write(result)
 	if err != nil {
-		panic(err)
+		fmt.Println("error writing to client", err)
 	}
+	fmt.Println("responded to client with", data)
+}
 
-	fmt.Println(serverEventFd, uiEventFd)
-
-	config := ipc.InitConfigIPC{
-		ServerEventFd: serverEventFd,
-		GuiEventFd:    uiEventFd,
-		Ingoing:       ipcIn,
-		Outgoing:      ipcOut,
-	}
-
-	defer func() {
-		if p := recover(); p != nil {
-			panicErr, ok := p.(error)
-			if ok {
-				logger.Error("error start application", panicErr)
+func (daemon *DaemonServer) dispatchMessages(messageQueue chan client.Message) {
+	for clientMessage := range messageQueue {
+		if tasks.IsTask(clientMessage.Type) {
+			err := tasks.Launch(clientMessage, daemon.response)
+			if err != nil {
+				fmt.Println("task failed to launch", err)
 			}
 		}
-		err := ipc.UnlinkShmMem()
-		if err != nil {
-			logger.Log.Error(err.Error())
+
+		if clientMessage.Type == client.RequestHandshake {
+			// reqData, _ := clientMessage.Data.(client.RequestHandshakeData)
+			// daemon.p2pServer.RequestHandshake(reqData.Addr)
 		}
+	}
+}
 
-		err = ipc.CloseEventFds(config)
-		if err != nil {
-			logger.Log.Error(err.Error())
+func listenMessages(daemon *DaemonServer, messageBuffer chan client.Message) {
+	buffer := make([]byte, 1024)
+	for {
+		r, err := daemon.clientConn.Read(buffer)
+		if r <= 0 {
+			continue
 		}
+		if err != nil {
+			fmt.Println("failed to read from client connection", err)
+		}
+		fmt.Println("received from client", string(buffer[:r]))
+		message := client.Message{}
+		if err := json.Unmarshal(buffer[:r], &message); err != nil {
+			fmt.Printf("failed to unmarshal client message %v\n", err)
+			continue
+		}
+		messageBuffer <- message
+		// fmt.Println(message)
 
-		logger.Log.Info("shutdown")
-	}()
+	}
+}
 
-	ipcState, err := ipc.InitIPC(config)
+func main() {
+	fmt.Println("hhhhhhhhhhhhhhhhhhh")
+	exitSignal := make(chan os.Signal, 1)
+
+	server, err := initializeDaemon()
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to establish unix connection with client %v\n", err)
+	}
+	p2pServer, err := p2p.InitServer()
+	if err != nil {
+		log.Fatalf("failed to initialize p2p server %v\n", err)
 	}
 
-	signal.Notify(exitSignal, syscall.SIGTERM)
-	signal.Notify(exitSignal, syscall.SIGINT)
-
-	go signaling.Listen()
-	go dispatcher.Dispatch()
-	go ipcState.Listen()
-	go ipcState.ProccessQueue()
-	go p2pServer.Listen()
-	go p2pServer.ProccessQueue()
-	go ipcState.WatchGUIhealth(exitSignal)
-
-	logger.Log.Info("server is working")
+	server.p2pServer = p2pServer
+	defer server.listener.Close()
+	defer server.clientConn.Close()
+	messageChan := make(chan client.Message)
+	go listenMessages(server, messageChan)
+	go server.dispatchMessages(messageChan)
 	<-exitSignal
 }

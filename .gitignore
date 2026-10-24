@@ -1,9 +1,5 @@
-/.vscode
 main
 debug
 ips
-/gui/out
-/gui/dependencies/
-/gui/.vscode
-/gui/compile_commands.json
-/gui/.cache
+/desktop/external-libs
+/desktop/app
