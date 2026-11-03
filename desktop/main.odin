@@ -5,6 +5,10 @@ import "core:c"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
+import "core:os"
+import "core:path/slashpath"
+import "core:slice"
+import "core:strings"
 import "core:sys/posix"
 import "core:thread"
 import tfdialog "external-libs/tinyfiledialogs"
@@ -12,7 +16,6 @@ import "gui"
 import client_net "network"
 import "network/transport"
 import rl "vendor:raylib"
-
 
 Callback_Context :: struct {
 	session: ^client.Session,
@@ -37,29 +40,30 @@ listenServer :: proc(task: thread.Task) {
 			fmt.println(string(buffer[:n]))
 		}
 
-		server_message: client.Server_Message
-		err := json.unmarshal(buffer[:], &server_message)
+		header: client.Message_Header
+		err := json.unmarshal(buffer[:n], &header)
 		if err != nil {
 			fmt.printf("couldn't unmarshal server message: %v\n", err)
 			continue
 		}
-		fmt.println("server_message", server_message)
-		fmt.println("server_message.type", server_message.type)
-		handler, ok := client.get_handlers()[server_message.type]
+		fmt.println("server_message.type", header.type)
+		// fmt.println("server_message.data", string(header.data))
+		handler, ok := client.get_handlers()[header.type]
 		if !ok {
-			fmt.printf("handler %v is not registered\n", server_message.type)
-			fmt.printf("%d\n", server_message.type)
+			fmt.printf("handler %v is not registered\n", header.type)
 			continue
 		}
 
 		handler_data_context := new(struct {
 				handler_procedure: client.Message_Handler,
-				handler_data:      client.Message_Data,
+				message_type:      client.EventType,
+				handler_data:      []byte,
 				ctx:               ^client.Session,
 			})
 
 		handler_data_context.ctx = user_data.data_context
-		handler_data_context.handler_data = server_message.data
+		handler_data_context.message_type = header.type
+		handler_data_context.handler_data = slice.clone(buffer[:n])
 		handler_data_context.handler_procedure = handler
 
 
@@ -76,15 +80,19 @@ listenServer :: proc(task: thread.Task) {
 thread_handle_server_message :: proc(task: thread.Task) {
 	context_data := cast(^struct {
 		handler_procedure: client.Message_Handler,
-		handler_data:      client.Message_Data,
+		message_type:      client.EventType,
+		handler_data:      []byte,
 		ctx:               ^client.Session,
 	})task.data
 	context_data.handler_procedure(context_data.handler_data, context_data.ctx)
+	delete(context_data.handler_data)
 	free(context_data)
 }
 
 
 main :: proc() {
+
+
 	m_n := rl.GetCurrentMonitor()
 	monitor_height: c.int = 800
 	monitor_width: c.int = 600
@@ -99,8 +107,12 @@ main :: proc() {
 	gui.init(ui)
 	defer gui.shutdown(ui)
 
-	path := "/tmp/unix.sock"
-	socket := transport.connect_unix_socket(path)
+
+	sock_path := "/tmp/unix.sock"
+	if len(os.args) - 1 > 0 {
+		sock_path = slashpath.join({"/tmp/", fmt.tprintf("%s.sock", os.args[1])})
+	}
+	socket := transport.connect_unix_socket(sock_path)
 	server_conn := client_net.Server_Conn {
 		socket = socket,
 	}
@@ -164,7 +176,10 @@ draw_main_screen :: proc(
 	w, h := rl.GetScreenWidth(), rl.GetScreenHeight()
 	if !gui.window(ui, "file transfer", {0, 0, i32(w), i32(h)}) do return
 	defer gui.end_window(ui)
-
+	gui.section(ui, fmt.tprintf("Public ip: %s", session.public_ip, newline = true))
+	if gui.button(ui, "Copy public ip") {
+		rl.SetClipboardText(strings.clone_to_cstring(session.public_ip, context.temp_allocator))
+	}
 	gui.section(ui, "Peers")
 	gui.row(ui, 2)
 	if gui.primary_button(ui, "Discover") {
@@ -197,11 +212,17 @@ draw_main_screen :: proc(
 	gui.row_widths(ui, {-90, -1})
 	gui.text_dim(ui, "")
 	if gui.primary_button(ui, "Connect") || submitted {
-		state.status = fmt.bprintf(
-			state.status_buf[:],
-			"connecting to %s",
-			gui.text_input_string(&state.peer_address),
-		)
+		peer_addr := gui.text_input_string(&state.peer_address)
+		state.status = fmt.bprintf(state.status_buf[:], "connecting to %s", peer_addr)
+		msg := client.Message {
+			type = client.EventType.RequestHandshake,
+			data = client.Handshake_Request{endpoint = peer_addr},
+		}
+		if err := client.write(msg, conn); err != nil {
+			fmt.printf("error request handshake write %v\n", err)
+		}
+
+
 	}
 
 	gui.section(ui, "Send file")

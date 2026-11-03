@@ -1,39 +1,89 @@
 package p2p
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"strconv"
 	"sync"
+	"time"
 
-	"github.com/google/uuid"
 	"github.com/pion/stun"
 )
 
 type Server struct {
-	socket   *net.UDPConn
-	response responseMap
+	socket             *net.UDPConn
+	operationResponses operationResponseMap
+	PublicIP           string
+	messages           chan connMessage
 }
 
-type responseMap struct {
-	mappings map[uuid.UUID]chan Response
+type peerState uint8
+
+const (
+	Connecting peerState = iota
+	Connected
+	Failed
+)
+
+type operationResponseMap struct {
+	mappings map[MessageType]responseMap
 	mu       *sync.Mutex
 }
 
-func (rmap *responseMap) get(id uuid.UUID) (chan Response, bool) {
-	ok, ch := rmap.mappings[id]
-	return ok, ch
+func (rmap *operationResponseMap) get(operation MessageType) (responseMap, bool) {
+	chMap, ok := rmap.mappings[operation]
+	return chMap, ok
 }
 
-func (rmap *responseMap) add(id uuid.UUID, ch chan Response) {
+func (rmap *operationResponseMap) add(operation MessageType, chMap responseMap) {
+	rmap.mu.Lock()
+	rmap.mappings[operation] = chMap
+	rmap.mu.Unlock()
+}
+
+func (rmap *operationResponseMap) delete(operation MessageType) {
+	rmap.mu.Lock()
+	delete(rmap.mappings, operation)
+	rmap.mu.Unlock()
+}
+
+type connMessage struct {
+	addr   netip.AddrPort
+	buffer []byte
+}
+
+type responseMap struct {
+	mappings map[netip.AddrPort]chan Response
+	mu       *sync.Mutex
+}
+
+// ::ffff:1.2.3.4 -> 1.2.3.4, 0.0.0.0 -> 127.0.0.1
+func normalizeLocalAddrPort(addr netip.AddrPort) netip.AddrPort {
+	ip := addr.Addr().Unmap()
+	if ip.IsUnspecified() {
+		ip = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	}
+	return netip.AddrPortFrom(ip, addr.Port())
+}
+
+func (rmap *responseMap) get(id netip.AddrPort) (chan Response, bool) {
+	rmap.mu.Lock()
+	ch, ok := rmap.mappings[id]
+	rmap.mu.Unlock()
+	return ch, ok
+}
+
+func (rmap *responseMap) add(id netip.AddrPort, ch chan Response) {
 	rmap.mu.Lock()
 	rmap.mappings[id] = ch
 	rmap.mu.Unlock()
 }
 
-func (rmap *responseMap) delete(id uuid.UUID, ch chan Response) {
+func (rmap *responseMap) delete(id netip.AddrPort) {
 	rmap.mu.Lock()
 	delete(rmap.mappings, id)
 	rmap.mu.Unlock()
@@ -41,21 +91,28 @@ func (rmap *responseMap) delete(id uuid.UUID, ch chan Response) {
 
 type MessageType uint8
 
+const keepaliveInterval int = 15
+
 const (
 	ACKNL MessageType = iota
+	RES_ACKNL
 )
 
+var operations []MessageType = []MessageType{
+	ACKNL, RES_ACKNL,
+}
+
 type Response struct {
-	result  error
+	err     error
 	message Message
 }
 
 type Message struct {
 	Type MessageType `json:"type"`
-	ID   uuid.UUID   `json:"id"`
+	Data any         `json:"data"`
 }
 
-func getPublicIp(socket *net.UDPConn) (*netip.AddrPort, error) {
+func getPublicIp(socket *net.UDPConn, messages chan connMessage) (*netip.AddrPort, error) {
 	var stunErr error
 	rawUri := "stun.l.google.com:19302"
 	var publicAddr netip.AddrPort
@@ -72,7 +129,7 @@ func getPublicIp(socket *net.UDPConn) (*netip.AddrPort, error) {
 	stunR, stunW := net.Pipe()
 
 	go multiplex(socket, *stunAddr, stunR)
-	go demultiplex(socket, stunR)
+	go demultiplex(socket, stunR, messages)
 
 	client, err := stun.NewClient(stunW, stun.WithNoConnClose())
 	if err != nil {
@@ -102,7 +159,21 @@ func getPublicIp(socket *net.UDPConn) (*netip.AddrPort, error) {
 		return nil, stunErr
 	}
 
+	go keepAlive(client, keepaliveInterval)
 	return &publicAddr, nil
+}
+
+func keepAlive(c *stun.Client, interval int) {
+	t := time.NewTicker(time.Second * time.Duration(interval))
+	for range t.C {
+		if err := c.Do(stun.MustBuild(stun.TransactionID, stun.BindingRequest), func(res stun.Event) {
+			if res.Error != nil {
+				log.Printf("Failed STUN transaction: %s\n", res.Error)
+			}
+		}); err != nil {
+			log.Printf("Failed STUN transaction: %s\n", err)
+		}
+	}
 }
 
 func multiplex(conn *net.UDPConn, stunAddr net.UDPAddr, stunReader net.Conn) {
@@ -124,10 +195,10 @@ func multiplex(conn *net.UDPConn, stunAddr net.UDPAddr, stunReader net.Conn) {
 	}
 }
 
-func demultiplex(conn *net.UDPConn, stunR net.Conn) {
+func demultiplex(conn *net.UDPConn, stunR net.Conn, messages chan connMessage) {
 	var buffer []byte = make([]byte, 1024)
 	for {
-		n, err := conn.Read(buffer)
+		n, addr, err := conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
 			fmt.Printf("failed to read socket %v\n", err)
 		}
@@ -139,9 +210,10 @@ func demultiplex(conn *net.UDPConn, stunR net.Conn) {
 			stunR.Write(buffer[:n])
 			continue
 		}
-		if _, err = conn.Write(buffer[:n]); err != nil {
-			fmt.Printf("socket write fail: %v\n", err)
-			continue
+		fmt.Println("demultiplexing outbound", addr, string(buffer[:n]))
+		messages <- connMessage{
+			addr:   normalizeLocalAddrPort(addr),
+			buffer: buffer[:n],
 		}
 	}
 
@@ -153,61 +225,47 @@ func InitServer() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	rMap := responseMap{
+	opMappings := operationResponseMap{
+		mappings: make(map[MessageType]responseMap),
 		mu:       &sync.Mutex{},
-		mappings: make(map[uuid.UUID]chan Response),
 	}
-	if public, err = getPublicIp(socket); err != nil {
+	for _, operation := range operations {
+		rMap := responseMap{
+			mu:       &sync.Mutex{},
+			mappings: make(map[netip.AddrPort]chan Response),
+		}
+		opMappings.mappings[operation] = rMap
+	}
+
+	messages := make(chan connMessage)
+	if public, err = getPublicIp(socket, messages); err != nil {
 		return nil, err
 	}
 	fmt.Println(public)
 	fmt.Println("p2p server is listening on", socket.LocalAddr().String())
 	return &Server{
-		response: rMap,
-		socket:   socket,
+		socket:             socket,
+		PublicIP:           public.String(),
+		messages:           messages,
+		operationResponses: opMappings,
 	}, nil
 
 }
 
-func (server *Server) process() {
-	var buffer []byte = make([]byte, 1024)
-	for {
-		var msg Message
-		r, source, err := server.socket.ReadFromUDPAddrPort(buffer)
-		if err != nil {
-			fmt.Printf("error reading udp socket %v\n", err)
-			continue
-		}
-
-		fmt.Println("got message from", source.Addr().String())
-
-		if err := json.Unmarshal(buffer[:r], &msg); err != nil {
-			fmt.Printf("unable to unmarshal json from %s, error: %v\n", source.Addr().String(), err)
-			continue
-		}
-
-		responseChan, ok := server.response.get(msg.ID)
-		if ok {
-			responseChan <- Response{
-				result: nil, message: msg,
-			}
-		}
-
+func (server *Server) writeToStringAddr(msg Message, addr string) error {
+	addrPort, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return err
 	}
+	return server.write(msg, addrPort)
 }
-
-func (server *Server) write(msg Message, addr string) error {
+func (server *Server) write(msg Message, addr netip.AddrPort) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("couldn't marshal message, error: %v\n", err)
 	}
 
-	addrPort, err := netip.ParseAddrPort(addr)
-	if err != nil {
-		return err
-	}
-
-	n, err := server.socket.WriteToUDP(payload, net.UDPAddrFromAddrPort(addrPort))
+	n, err := server.socket.WriteToUDP(payload, net.UDPAddrFromAddrPort(addr))
 	if err != nil {
 		return fmt.Errorf("coudlb't write to %s, err: %v\n", addr, err)
 	}
@@ -220,30 +278,166 @@ func createIndexKey(first string, messageType MessageType) string {
 	return fmt.Sprintf("%s:%s", first, strconv.Itoa(int(messageType)))
 }
 
-func newMessage(msgType MessageType) Message {
-	return Message{
-		Type: msgType,
-		ID:   uuid.New(),
+// func newMessage(msgType MessageType) Message {
+// 	return Message{
+// 		Type: msgType,
+// 		ID:   uuid.New(),
+// 	}
+// }
+
+// func (server *Server) SendWithResponse(msg Message, addr string) chan Response {
+// 	responseCh := make(chan Response, 1)
+// 	err := server.writeToStringAddr(msg, addr)
+// 	if err != nil {
+
+// 	}
+// 	server.response.add(msg.ID, responseCh)
+// 	return responseCh
+// }
+
+// func (server *Server) Acknowledge(addr string) (net.Addr, bool, error) {
+// 	fmt.Println("acknowledge", addr)
+
+// 	response := <-server.SendWithResponse(newMessage(ACKNL), addr)
+// 	if response.result != nil {
+// 		return nil, false, response.result
+// 	}
+
+// 	return nil, false, nil
+// }
+
+func (server *Server) postResponseChan(msgType MessageType, addr netip.AddrPort) error {
+	responseMap, exist := server.operationResponses.get(msgType)
+	if !exist {
+		return fmt.Errorf("response map of operation type %v does not exist", msgType)
 	}
+	responseMap.add(addr, make(chan Response))
+	return nil
 }
 
-func (server *Server) SendWithResponse(msg Message, addr string) chan Response {
-	responseCh := make(chan Response, 1)
-	err := server.write(msg, addr)
+func (server *Server) getResponseChan(msgType MessageType, addr netip.AddrPort) (chan Response, error) {
+	responseMap, exist := server.operationResponses.get(msgType)
+	if !exist {
+		return nil, fmt.Errorf("response map of operation type %v does not exist", msgType)
+	}
+	responseCh, ok := responseMap.get(addr)
+	if !ok {
+		return nil, fmt.Errorf("response channel of operation type %v, addr %v does not exist", msgType, addr)
+	}
+
+	return responseCh, nil
+
+}
+
+func (server *Server) Connect(ctx context.Context, addrRaw string) (*net.UDPAddr, error) {
+	var endpoint *net.UDPAddr
+	addrPort, err := netip.ParseAddrPort(addrRaw)
 	if err != nil {
-
+		return endpoint, err
 	}
-	server.response.add(msg.ID, responseCh)
-	return responseCh
+	addrPort = normalizeLocalAddrPort(addrPort)
+
+	// post response that i expect from other peer
+	if err := server.postResponseChan(RES_ACKNL, addrPort); err != nil {
+		return nil, err
+	}
+
+	responseCh, err := server.getResponseChan(RES_ACKNL, addrPort)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		defer cancel()
+
+		ticker := time.NewTicker(time.Second * 1)
+		defer ticker.Stop()
+
+		timer := time.NewTimer(time.Second * 10)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				server.write(Message{
+					Type: ACKNL,
+				}, addrPort)
+			case <-timer.C:
+				cancel()
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-responseCh:
+
+				fmt.Println("got it", msg)
+				ip := addrPort.Addr().As16()
+				endpoint = &net.UDPAddr{IP: ip[:], Port: int(addrPort.Port())}
+				cancel()
+			}
+		}
+
+	}()
+
+	wg.Wait()
+
+	if endpoint == nil {
+		err = fmt.Errorf("couldn't establish connection with %v\n", addrPort)
+	}
+
+	return endpoint, err
 }
 
-func (server *Server) Acknowledge(addr string) (net.Addr, bool, error) {
-	fmt.Println("acknowledge", addr)
+func (server *Server) Dispatch(daemonDispatcher chan Message) {
 
-	response := <-server.SendWithResponse(newMessage(ACKNL), addr)
-	if response.result != nil {
-		return nil, false, response.result
+	for msg := range server.messages {
+
+		fmt.Println("got message from", msg.addr.String())
+		var payload Message
+		if err := json.Unmarshal(msg.buffer, &payload); err != nil {
+			fmt.Printf("unable to unmarshal json from %s, error: %v\n", msg.buffer, err)
+			continue
+		}
+		if payload.Type == ACKNL {
+			fmt.Printf("%v requested handshake\n", msg.addr)
+			server.writeToStringAddr(Message{
+				Type: RES_ACKNL,
+			}, msg.addr.String())
+			continue
+		}
+		fmt.Println(server.operationResponses.mappings)
+		chMap, ok := server.operationResponses.get(payload.Type)
+		if !ok {
+			fmt.Printf("failed to dispatch p2p server message, couldn't find response map for given operation %v\n", payload.Type)
+			continue
+		}
+
+		responseCh, ok := chMap.get(msg.addr)
+		if !ok {
+			fmt.Printf("failed to dispatch p2p server message, couldn't find response map for %v address of operation type %v\n", msg.addr, payload.Type)
+			continue
+		}
+
+		responseCh <- Response{
+			message: payload,
+		}
+
 	}
-
-	return nil, false, nil
 }

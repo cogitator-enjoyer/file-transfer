@@ -10,13 +10,13 @@ Unix_Socket :: struct {
 }
 
 
-connect_unix_socket :: proc(path: string) -> Unix_Socket {
+connect_unix_socket :: proc(sock_path: string) -> Unix_Socket {
 	unix_sock_fd := posix.socket(posix.AF.UNIX, posix.Sock.SEQPACKET)
 
 	addr: posix.sockaddr
 	addr.sa_family = posix.sa_family_t.UNIX
 
-	copy(addr.sa_data[:], fmt.tprintf("%s\x00", path))
+	copy(addr.sa_data[:], fmt.tprintf("%s\x00", sock_path))
 
 	res := posix.bind(unix_sock_fd, &addr, size_of(addr))
 	conn_err := posix.connect(unix_sock_fd, &addr, size_of(addr))

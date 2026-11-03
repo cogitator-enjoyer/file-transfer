@@ -6,6 +6,7 @@ import "core:fmt"
 
 Session :: struct {
 	addresses: [dynamic]string,
+	public_ip: string
 }
 
 Read_Error :: union #shared_nil {
