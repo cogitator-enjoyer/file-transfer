@@ -3,22 +3,25 @@ package p2p
 import (
 	"context"
 	"encoding/json"
+	events "file-transfer/protocols/p2p"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
-	"strconv"
+	"os"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/pion/stun"
 )
 
 type Server struct {
-	socket             *net.UDPConn
-	operationResponses operationResponseMap
-	PublicIP           string
-	messages           chan connMessage
+	socket   *net.UDPConn
+	peers    peerHub
+	PublicIP string
+	messages chan connMessage
+	events   chan events.Event
 }
 
 type peerState uint8
@@ -27,28 +30,58 @@ const (
 	Connecting peerState = iota
 	Connected
 	Failed
+	NewPeer
 )
 
-type operationResponseMap struct {
-	mappings map[MessageType]responseMap
-	mu       *sync.Mutex
+type sessionPeer struct {
+	state     peerState
+	inbox     chan Message
+	addr      netip.AddrPort
+	responses responseMap
 }
 
-func (rmap *operationResponseMap) get(operation MessageType) (responseMap, bool) {
-	chMap, ok := rmap.mappings[operation]
-	return chMap, ok
+func (p *sessionPeer) run() {
+	for msg := range p.inbox {
+		response, ok := p.responses.get(msg.EventID)
+		if !ok {
+			fmt.Printf("can't find response channel for peer %v, event type %v, event id %v\n", p.addr, msg.Type, msg.EventID)
+		}
+		if msg.Type == RES_ACKNL {
+			p.state = Connected
+			fmt.Printf("peer with addr %v is connected!\n", p.addr.Addr().String())
+		}
+		response <- Response{
+			message: msg,
+		}
+	}
 }
 
-func (rmap *operationResponseMap) add(operation MessageType, chMap responseMap) {
-	rmap.mu.Lock()
-	rmap.mappings[operation] = chMap
-	rmap.mu.Unlock()
+type peerHub struct {
+	mu   *sync.Mutex
+	pmap map[netip.AddrPort]*sessionPeer
 }
 
-func (rmap *operationResponseMap) delete(operation MessageType) {
-	rmap.mu.Lock()
-	delete(rmap.mappings, operation)
-	rmap.mu.Unlock()
+func (h peerHub) getOrCreate(addr netip.AddrPort) *sessionPeer {
+	h.mu.Lock()
+	peer, ok := h.get(addr)
+	if ok {
+		return peer
+	}
+
+	peer = new(sessionPeer)
+	peer.state = NewPeer
+	peer.inbox = make(chan Message)
+	peer.responses = responseMap{mappings: make(map[uuid.UUID]chan Response), mu: &sync.Mutex{}}
+	h.pmap[addr] = peer
+
+	go peer.run()
+	h.mu.Unlock()
+	return peer
+}
+
+func (p peerHub) get(addr netip.AddrPort) (*sessionPeer, bool) {
+	peer, ok := p.pmap[addr]
+	return peer, ok
 }
 
 type connMessage struct {
@@ -57,7 +90,7 @@ type connMessage struct {
 }
 
 type responseMap struct {
-	mappings map[netip.AddrPort]chan Response
+	mappings map[uuid.UUID]chan Response
 	mu       *sync.Mutex
 }
 
@@ -70,20 +103,22 @@ func normalizeLocalAddrPort(addr netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(ip, addr.Port())
 }
 
-func (rmap *responseMap) get(id netip.AddrPort) (chan Response, bool) {
+func (rmap *responseMap) get(id uuid.UUID) (chan Response, bool) {
 	rmap.mu.Lock()
 	ch, ok := rmap.mappings[id]
 	rmap.mu.Unlock()
+
 	return ch, ok
 }
 
-func (rmap *responseMap) add(id netip.AddrPort, ch chan Response) {
+func (rmap *responseMap) add(id uuid.UUID, ch chan Response) {
 	rmap.mu.Lock()
+	fmt.Println("adding response channel with id", id)
 	rmap.mappings[id] = ch
 	rmap.mu.Unlock()
 }
 
-func (rmap *responseMap) delete(id netip.AddrPort) {
+func (rmap *responseMap) delete(id uuid.UUID) {
 	rmap.mu.Lock()
 	delete(rmap.mappings, id)
 	rmap.mu.Unlock()
@@ -98,28 +133,28 @@ const (
 	RES_ACKNL
 )
 
-var operations []MessageType = []MessageType{
-	ACKNL, RES_ACKNL,
-}
-
 type Response struct {
 	err     error
 	message Message
 }
 
 type Message struct {
-	Type MessageType `json:"type"`
-	Data any         `json:"data"`
+	EventID uuid.UUID   `json:"event_id"`
+	Type    MessageType `json:"type"`
+	Data    any         `json:"data"`
+}
+
+var operations []MessageType = []MessageType{
+	ACKNL, RES_ACKNL,
 }
 
 func getPublicIp(socket *net.UDPConn, messages chan connMessage) (*netip.AddrPort, error) {
 	var stunErr error
-	rawUri := "stun.l.google.com:19302"
+	rawUri := os.Getenv("STUN_ADDR")
+	if rawUri == "" {
+		rawUri = "stun.l.google.com:19302"
+	}
 	var publicAddr netip.AddrPort
-	// uri, err := stun.ParseURI(rawUri)
-	// if err != nil {
-	// 	return err
-	// }
 
 	stunAddr, err := net.ResolveUDPAddr("udp", rawUri)
 	if err != nil {
@@ -225,31 +260,28 @@ func InitServer() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	opMappings := operationResponseMap{
-		mappings: make(map[MessageType]responseMap),
-		mu:       &sync.Mutex{},
-	}
-	for _, operation := range operations {
-		rMap := responseMap{
-			mu:       &sync.Mutex{},
-			mappings: make(map[netip.AddrPort]chan Response),
-		}
-		opMappings.mappings[operation] = rMap
-	}
 
 	messages := make(chan connMessage)
 	if public, err = getPublicIp(socket, messages); err != nil {
 		return nil, err
 	}
+
 	fmt.Println(public)
 	fmt.Println("p2p server is listening on", socket.LocalAddr().String())
 	return &Server{
-		socket:             socket,
-		PublicIP:           public.String(),
-		messages:           messages,
-		operationResponses: opMappings,
+		socket:   socket,
+		PublicIP: public.String(),
+		messages: messages,
+		peers: peerHub{
+			pmap: make(map[netip.AddrPort]*sessionPeer),
+			mu:   &sync.Mutex{},
+		},
 	}, nil
 
+}
+
+func (server *Server) Close() error {
+	return server.socket.Close()
 }
 
 func (server *Server) writeToStringAddr(msg Message, addr string) error {
@@ -274,79 +306,35 @@ func (server *Server) write(msg Message, addr netip.AddrPort) error {
 	return nil
 }
 
-func createIndexKey(first string, messageType MessageType) string {
-	return fmt.Sprintf("%s:%s", first, strconv.Itoa(int(messageType)))
-}
-
-// func newMessage(msgType MessageType) Message {
-// 	return Message{
-// 		Type: msgType,
-// 		ID:   uuid.New(),
-// 	}
-// }
-
-// func (server *Server) SendWithResponse(msg Message, addr string) chan Response {
-// 	responseCh := make(chan Response, 1)
-// 	err := server.writeToStringAddr(msg, addr)
-// 	if err != nil {
-
-// 	}
-// 	server.response.add(msg.ID, responseCh)
-// 	return responseCh
-// }
-
-// func (server *Server) Acknowledge(addr string) (net.Addr, bool, error) {
-// 	fmt.Println("acknowledge", addr)
-
-// 	response := <-server.SendWithResponse(newMessage(ACKNL), addr)
-// 	if response.result != nil {
-// 		return nil, false, response.result
-// 	}
-
-// 	return nil, false, nil
-// }
-
-func (server *Server) postResponseChan(msgType MessageType, addr netip.AddrPort) error {
-	responseMap, exist := server.operationResponses.get(msgType)
-	if !exist {
-		return fmt.Errorf("response map of operation type %v does not exist", msgType)
-	}
-	responseMap.add(addr, make(chan Response))
-	return nil
-}
-
-func (server *Server) getResponseChan(msgType MessageType, addr netip.AddrPort) (chan Response, error) {
-	responseMap, exist := server.operationResponses.get(msgType)
-	if !exist {
-		return nil, fmt.Errorf("response map of operation type %v does not exist", msgType)
-	}
-	responseCh, ok := responseMap.get(addr)
-	if !ok {
-		return nil, fmt.Errorf("response channel of operation type %v, addr %v does not exist", msgType, addr)
-	}
-
-	return responseCh, nil
-
-}
-
 func (server *Server) Connect(ctx context.Context, addrRaw string) (*net.UDPAddr, error) {
-	var endpoint *net.UDPAddr
 	addrPort, err := netip.ParseAddrPort(addrRaw)
 	if err != nil {
-		return endpoint, err
+		return nil, err
 	}
 	addrPort = normalizeLocalAddrPort(addrPort)
 
-	// post response that i expect from other peer
-	if err := server.postResponseChan(RES_ACKNL, addrPort); err != nil {
-		return nil, err
+	ip := addrPort.Addr()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return server.connectLocal(ctx, addrPort)
 	}
 
-	responseCh, err := server.getResponseChan(RES_ACKNL, addrPort)
-	if err != nil {
-		return nil, err
-	}
+	panic("not implemented")
 
+}
+
+func (server *Server) connectLocal(ctx context.Context, addrPort netip.AddrPort) (*net.UDPAddr, error) {
+	var err error
+	var endpoint *net.UDPAddr
+
+	eventUUID := uuid.New()
+	peer := server.peers.getOrCreate(addrPort)
+	resp := make(chan Response)
+	peer.responses.add(eventUUID, resp)
+
+	outMessage := Message{
+		Type:    ACKNL,
+		EventID: eventUUID,
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -366,9 +354,7 @@ func (server *Server) Connect(ctx context.Context, addrRaw string) (*net.UDPAddr
 		for {
 			select {
 			case <-ticker.C:
-				server.write(Message{
-					Type: ACKNL,
-				}, addrPort)
+				server.write(outMessage, addrPort)
 			case <-timer.C:
 				cancel()
 				return
@@ -385,7 +371,7 @@ func (server *Server) Connect(ctx context.Context, addrRaw string) (*net.UDPAddr
 			select {
 			case <-ctx.Done():
 				return
-			case msg := <-responseCh:
+			case msg := <-resp:
 
 				fmt.Println("got it", msg)
 				ip := addrPort.Addr().As16()
@@ -397,7 +383,6 @@ func (server *Server) Connect(ctx context.Context, addrRaw string) (*net.UDPAddr
 	}()
 
 	wg.Wait()
-
 	if endpoint == nil {
 		err = fmt.Errorf("couldn't establish connection with %v\n", addrPort)
 	}
@@ -416,28 +401,25 @@ func (server *Server) Dispatch(daemonDispatcher chan Message) {
 			continue
 		}
 		if payload.Type == ACKNL {
-			fmt.Printf("%v requested handshake\n", msg.addr)
-			server.writeToStringAddr(Message{
-				Type: RES_ACKNL,
-			}, msg.addr.String())
+			handleRequestHandshake(payload, server, msg.addr)
 			continue
 		}
-		fmt.Println(server.operationResponses.mappings)
-		chMap, ok := server.operationResponses.get(payload.Type)
-		if !ok {
-			fmt.Printf("failed to dispatch p2p server message, couldn't find response map for given operation %v\n", payload.Type)
-			continue
-		}
-
-		responseCh, ok := chMap.get(msg.addr)
-		if !ok {
-			fmt.Printf("failed to dispatch p2p server message, couldn't find response map for %v address of operation type %v\n", msg.addr, payload.Type)
-			continue
-		}
-
-		responseCh <- Response{
-			message: payload,
-		}
+		peer := server.peers.getOrCreate(msg.addr)
+		peer.inbox <- payload
 
 	}
+}
+
+func handleRequestHandshake(msg Message, server *Server, from netip.AddrPort) {
+	ip := from.Addr()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		fmt.Printf("%v requested handshake from local network\n", from)
+		server.writeToStringAddr(Message{
+			Type:    RES_ACKNL,
+			EventID: msg.EventID,
+		}, from.String())
+	} else {
+		//
+	}
+
 }

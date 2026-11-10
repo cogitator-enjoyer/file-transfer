@@ -40,14 +40,13 @@ listenServer :: proc(task: thread.Task) {
 			fmt.println(string(buffer[:n]))
 		}
 
-		header: client.Message_Header
+		header: client.Event_Header
 		err := json.unmarshal(buffer[:n], &header)
 		if err != nil {
 			fmt.printf("couldn't unmarshal server message: %v\n", err)
 			continue
 		}
 		fmt.println("server_message.type", header.type)
-		// fmt.println("server_message.data", string(header.data))
 		handler, ok := client.get_handlers()[header.type]
 		if !ok {
 			fmt.printf("handler %v is not registered\n", header.type)
@@ -56,7 +55,7 @@ listenServer :: proc(task: thread.Task) {
 
 		handler_data_context := new(struct {
 				handler_procedure: client.Message_Handler,
-				message_type:      client.EventType,
+				message_type:      client.Event_Type,
 				handler_data:      []byte,
 				ctx:               ^client.Session,
 			})
@@ -80,7 +79,7 @@ listenServer :: proc(task: thread.Task) {
 thread_handle_server_message :: proc(task: thread.Task) {
 	context_data := cast(^struct {
 		handler_procedure: client.Message_Handler,
-		message_type:      client.EventType,
+		message_type:      client.Command,
 		handler_data:      []byte,
 		ctx:               ^client.Session,
 	})task.data
@@ -183,7 +182,7 @@ draw_main_screen :: proc(
 	gui.section(ui, "Peers")
 	gui.row(ui, 2)
 	if gui.primary_button(ui, "Discover") {
-		client.write(client.Message{type = .DiscoverLocal}, conn)
+		client.send(type = client.Command.DiscoverLocal, conn = conn)
 		state.status = "discovering..."
 	}
 	if gui.button(ui, "Clear") {
@@ -214,11 +213,12 @@ draw_main_screen :: proc(
 	if gui.primary_button(ui, "Connect") || submitted {
 		peer_addr := gui.text_input_string(&state.peer_address)
 		state.status = fmt.bprintf(state.status_buf[:], "connecting to %s", peer_addr)
-		msg := client.Message {
-			type = client.EventType.RequestHandshake,
-			data = client.Handshake_Request{endpoint = peer_addr},
-		}
-		if err := client.write(msg, conn); err != nil {
+
+		if err := client.send(
+			client.Command.RequestHandshake,
+			client.Handshake_Request{endpoint = peer_addr},
+			conn,
+		); err != nil {
 			fmt.printf("error request handshake write %v\n", err)
 		}
 
